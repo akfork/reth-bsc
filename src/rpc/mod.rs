@@ -11,6 +11,7 @@ mod finality;
 pub mod mev;
 pub mod miner;
 pub mod parlia;
+pub mod rbuilder_state;
 pub mod transaction;
 
 pub use admin::*;

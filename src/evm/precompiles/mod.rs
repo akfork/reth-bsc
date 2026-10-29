@@ -560,6 +560,35 @@ fn trace_map_for_spec(spec: BscHardfork) -> &'static PrecompileTraceMap {
     traced_precompiles_for_spec(spec).trace_map()
 }
 
+/// Push a precompile execution context for an embedded EVM (e.g. an external
+/// block builder like rbuilder that runs the BSC precompile set outside of the
+/// node's own pipeline).
+///
+/// Without a pushed context, precompiles executed through the traced wrappers
+/// (addresses 0x01-0x0a, 0x64-0x69) resolve against the *default* fork's trace
+/// map (`BscHardfork::default()` = Fermi), which silently misprices precompiles
+/// whose gas changed in later forks (e.g. EIP-7883 modexp in Mendel: 200 vs 500
+/// minimum). Embedded EVMs must push the correct `BscHardfork` before executing
+/// transactions and pop it afterwards, mirroring the node's executor.
+pub fn push_embedded_evm_precompile_context(spec: BscHardfork, block_number: u64) {
+    let ctx = PrecompileTraceContext::from_parts(
+        block_number,
+        spec,
+        false,
+        None,
+        None,
+        None,
+        0,
+    );
+    push_precompile_trace_context(ctx);
+}
+
+/// Pop a previously pushed embedded-EVM precompile context (see
+/// [`push_embedded_evm_precompile_context`]).
+pub fn pop_embedded_evm_precompile_context() {
+    pop_precompile_trace_context();
+}
+
 // --- Public precompile providers ----------------------------------------------------------------
 
 /// Returns precompiles for Istanbul spec.
