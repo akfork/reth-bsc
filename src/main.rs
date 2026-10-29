@@ -566,6 +566,17 @@ fn main() -> eyre::Result<()> {
                         ctx.modules.merge_if_module_configured(RethRpcModule::Miner, miner_api.into_rpc())?;
                         tracing::info!("Succeed to register Miner RPC API");
 
+                        // rbuilder_* historical-state access API (read-only; used by
+                        // external builders running rbuilder in IPC/HTTP state mode).
+                        tracing::info!("Start to register rbuilder State RPC API...");
+                        use reth_bsc::rpc::rbuilder_state::{RbuilderStateApiImpl, RbuilderStateApiServer};
+                        let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
+                        let rbuilder_api = RbuilderStateApiImpl::new(ctx.provider().clone());
+                        // Unconditional like `parlia`: every method is read-only and the
+                        // namespace is unknown to reth's module list.
+                        ctx.modules.merge_configured(rbuilder_api.into_rpc())?;
+                        tracing::info!("Succeed to register rbuilder State RPC API");
+
                         tracing::info!("Start to register BSC Eth extension API (eth_coinbase, eth_health, eth_getCAS20TokenInfo)...");
                         use reth_bsc::rpc::eth_ext::{BscEthExtApiImpl, BscEthExtApiServer};
                         use reth_rpc_eth_api::helpers::SpawnBlocking;
