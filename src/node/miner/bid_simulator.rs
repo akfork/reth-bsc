@@ -416,7 +416,23 @@ where
         // Clear old bids from best_bid_to_run, simulating_bid, and best_bid
         self.best_bid_to_run.write().retain(|_, bid| bid.block_number >= min_block_number);
         self.simulating_bid.write().retain(|_, bid| bid.block_number >= min_block_number);
-        self.best_bid.write().retain(|_, bid| bid.bid.block_number >= min_block_number);
+        {
+            let mut best_bid = self.best_bid.write();
+            let before = best_bid.len();
+            best_bid.retain(|parent, bid| {
+                let keep = bid.bid.block_number >= min_block_number;
+                if !keep {
+                    debug!(
+                        "best_bid evicted parent:{} block:{} min_block:{}",
+                        parent, bid.bid.block_number, min_block_number
+                    );
+                }
+                keep
+            });
+            if before != best_bid.len() {
+                debug!("best_bid evicted {} of {} entries", before - best_bid.len(), before);
+            }
+        }
 
         // Clear old BEP-675 BidBlocks (go-bsc `clearLoop` prunes `bestBidBlock[parentHash]` the
         // same way). Without this, every parent hash that ever received an admitted BidBlock keeps
@@ -898,7 +914,27 @@ where
 
     /// Get the best bid for a given parent hash
     pub fn get_best_bid(&self, parent_hash: B256) -> Option<BidRuntime<Pool, BscEvmConfig>> {
-        self.best_bid.read().get(&parent_hash).cloned()
+        let map = self.best_bid.read();
+        match map.get(&parent_hash).cloned() {
+            Some(runtime) => {
+                debug!(
+                    "get_best_bid hit parent:{} block:{} payload:{:?}",
+                    parent_hash,
+                    runtime.bid.block_number,
+                    runtime.bsc_payload.as_ref().map(|p| p.block.number),
+                );
+                Some(runtime)
+            }
+            None => {
+                debug!(
+                    "get_best_bid miss parent:{} ({} entries: {:?})",
+                    parent_hash,
+                    map.len(),
+                    map.values().map(|rt| (rt.bid.block_number, rt.bsc_payload.is_some())).collect::<Vec<_>>(),
+                );
+                None
+            }
+        }
     }
 
     /// Verify, blind-sign, and seal an admitted BEP-675 BidBlock, keeping the highest-fee one per
