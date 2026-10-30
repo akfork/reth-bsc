@@ -1,3 +1,4 @@
+use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::chainspec::BscChainSpec;
 use crate::consensus::parlia::{Snapshot, SnapshotProvider};
 use crate::hardforks::BscHardforks;
@@ -5,7 +6,6 @@ use crate::node::miner::bid_block::BidBlockArgs;
 use crate::node::miner::bid_simulator::Bid;
 use crate::node::miner::config::keystore;
 use crate::node::miner::config::MiningConfig;
-use crate::node::miner::payload::DELAY_LEFT_OVER;
 use alloy_consensus::BlobTransactionSidecar;
 use alloy_consensus::Transaction;
 use alloy_consensus::{transaction::RlpEcdsaDecodableTx, TxEip4844WithSidecar};
@@ -229,10 +229,7 @@ pub trait BscMevApi {
     /// Query a builder's current BEP-675 `SendBidBlock` permission (go-bsc
     /// `MevAPI.GetBidBlockPermission`): whether it's allowed, and if not, why and when it resets.
     #[method(name = "getBidBlockPermission")]
-    async fn get_bid_block_permission(
-        &self,
-        builder: Address,
-    ) -> RpcResult<BidBlockPermissionResult>;
+    async fn get_bid_block_permission(&self, builder: Address) -> RpcResult<BidBlockPermissionResult>;
 }
 
 const PAY_BID_TX_GAS_LIMIT: u64 = 25000;
@@ -250,11 +247,7 @@ const DEFAULT_ERROR: i32 = -32000;
 
 /// Reproduces go-bsc `Miner.bidBlockEnabled()`: a BidBlock is only accepted when MEV is running,
 /// the `BidBlockEnabled` flag is set, and the Pasteur fork is active at the chain head.
-fn bid_block_admission_enabled(
-    mev_running: bool,
-    flag_enabled: bool,
-    pasteur_active: bool,
-) -> bool {
+fn bid_block_admission_enabled(mev_running: bool, flag_enabled: bool, pasteur_active: bool) -> bool {
     mev_running && flag_enabled && pasteur_active
 }
 
@@ -363,11 +356,7 @@ fn reserve_pending_bid(
 /// parent's millisecond part shifts the deadline by up to a full block interval. The subtracted
 /// knob is `delay_left_over_ms` (go-bsc's `Config.DelayLeftOver`, default 15ms) —
 /// `no_interrupt_left_over` bounds bid *simulation* time and is a different, much larger, knob.
-fn bid_must_before_ms(
-    parent_timestamp_ms: u64,
-    block_interval_ms: u64,
-    delay_left_over_ms: u64,
-) -> u128 {
+fn bid_must_before_ms(parent_timestamp_ms: u64, block_interval_ms: u64, delay_left_over_ms: u64) -> u128 {
     (parent_timestamp_ms as u128 + block_interval_ms as u128)
         .saturating_sub(delay_left_over_ms as u128)
 }
@@ -662,11 +651,7 @@ impl MevApiImpl {
     /// `NewBidBlockPreSealVerifyError` (code `-38007`): the synchronous checks
     /// `preSealVerifyBidBlock` runs at admission failed.
     fn pre_seal_verify_failed(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
-        jsonrpsee::types::ErrorObject::owned(
-            BID_BLOCK_PRE_SEAL_VERIFY_ERROR,
-            msg.into(),
-            None::<()>,
-        )
+        jsonrpsee::types::ErrorObject::owned(BID_BLOCK_PRE_SEAL_VERIFY_ERROR, msg.into(), None::<()>)
     }
 
     /// `NewBidBlockTooLateError` (code `-38008`): the bid arrived after `bidMustBefore`.
@@ -1401,9 +1386,7 @@ mod bid_block_param_tests {
         // in-turn check, which is why `probeInTurn` can run against any head.
         let (_, head, inturn, bid_parent, head_hash, gas, txs) = valid_structure();
         assert_eq!(
-            super::validate_bid_block_structure(
-                head, head, inturn, bid_parent, head_hash, gas, txs
-            ),
+            super::validate_bid_block_structure(head, head, inturn, bid_parent, head_hash, gas, txs),
             Err(super::BidStructuralRejection::StaleNumber)
         );
         // Well below the head too, not just exactly at it.
@@ -1506,7 +1489,9 @@ mod bid_block_param_tests {
         // whose turn it is — that is what lets the probe run against any head without waiting.
         for inturn in [true, false] {
             assert_eq!(
-                super::validate_bid_block_structure(100, 100, inturn, bad_parent, head_hash, 0, 0),
+                super::validate_bid_block_structure(
+                    100, 100, inturn, bad_parent, head_hash, 0, 0
+                ),
                 Err(R::StaleNumber),
                 "number must be checked before everything else"
             );
@@ -1624,9 +1609,11 @@ mod bid_block_param_tests {
         // subtracting `no_interrupt_left_over` (500ms) instead of `delay_left_over` (15ms) made
         // the deadline land at-or-before the parent's own timestamp on Fermi's 450ms interval,
         // rejecting every bid as "too late" the instant the parent block appeared.
-        let parent_timestamp_ms = crate::consensus::parlia::util::calculate_millisecond_timestamp(
-            &alloy_consensus::Header { timestamp: 1_700_000_000, ..Default::default() },
-        );
+        let parent_timestamp_ms =
+            crate::consensus::parlia::util::calculate_millisecond_timestamp(&alloy_consensus::Header {
+                timestamp: 1_700_000_000,
+                ..Default::default()
+            });
         let fermi_block_interval_ms = 450;
         let delay_left_over_ms = 15;
 
