@@ -2266,6 +2266,16 @@ where
         // local build finished and no background tasks remain (the empty-mempool case), so without
         // the wait this decision is made at t≈0 and no bid can ever be seen.
         self.wait_for_submission_deadline()?;
+        // Re-sample the legacy BEP-322 store here, alongside the BEP-675 store.
+        // `collect_best_bid()` above runs at t≈0 — deliberately, because
+        // `collect_payload_candidates` blocks — but a builder's `mev_sendBid`
+        // cannot arrive before its own block is built, which for any real
+        // builder is a few hundred milliseconds into the slot. Sampling only at
+        // t≈0 therefore discards every SendBid: the bid is admitted, simulated
+        // and its payload built, yet `get_best_bid` is never hit again before
+        // the payload is picked. go-bsc samples both stores after the deadline
+        // wait, which is what makes `selectBidBlock`/`selectBid` see them.
+        self.collect_best_bid();
         self.collect_best_bid_block();
 
         // BEP-675 zero-simulate selection (go-bsc `selectBidBlock`): if the unexecuted BidBlock's
