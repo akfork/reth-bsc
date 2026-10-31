@@ -117,13 +117,6 @@ where
             })?;
             provider.block_hash(n).map_err(|e| err(e))?
         }
-        _ => {
-            return Err(jsonrpsee::types::ErrorObject::owned(
-                -32051,
-                "unsupported block id",
-                None::<()>,
-            ))
-        }
     };
     let hash = block_hash
         .ok_or_else(|| jsonrpsee::types::ErrorObject::owned(-32050, "block not found", None::<()>))?;
@@ -161,7 +154,7 @@ where
             .ok_or_else(|| jsonrpsee::types::ErrorObject::owned(-32050, "head block not found", None::<()>))?;
         let provider = self.provider.history_by_block_hash(hash).map_err(|e| err(e))?;
         let code = provider.bytecode_by_hash(&code_hash).map_err(|e| err(e))?;
-        Ok(code.map(|b| Bytes::from(b.original_bytes())))
+        Ok(code.map(|b| b.original_bytes()))
     }
 
     async fn get_block_hash(
