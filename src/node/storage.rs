@@ -2,6 +2,7 @@ use crate::{BscBlock, BscBlockBody, BscPrimitives};
 use crate::node::primitives::BscBlobTransactionSidecar;
 use alloy_consensus::BlockHeader;
 use alloy_eips::eip2718::{EIP4844_TX_TYPE_ID, Typed2718};
+use alloy_eips::eip4895::Withdrawals;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::B256;
 use reth_chainspec::EthereumHardforks;
@@ -108,12 +109,13 @@ where
     ) -> ProviderResult<Vec<BscBlockBody>> {
         // Pre-extract block metadata and per-tx (hash, type) before `inputs` is consumed.
         #[allow(clippy::type_complexity)]
-        let block_info: Vec<(u64, B256, Vec<(B256, u8)>)> = inputs
+        let block_info: Vec<(u64, B256, bool, Vec<(B256, u8)>)> = inputs
             .iter()
             .map(|(header, txs)| {
                 (
                     header.number(),
                     header.hash_slow(),
+                    header.withdrawals_root().is_some(),
                     txs.iter().map(|tx| (*tx.hash(), tx.ty())).collect(),
                 )
             })
@@ -125,7 +127,8 @@ where
         let bodies = eth_bodies
             .into_iter()
             .zip(block_info)
-            .map(|(inner, (block_number, block_hash, tx_info))| {
+            .map(|(mut inner, (block_number, block_hash, has_withdrawals_root, tx_info))| {
+                inner.withdrawals = committed_withdrawals(inner.withdrawals, has_withdrawals_root);
                 // Collect blob tx hashes and their position in the full block tx list.
                 let blob_txs: Vec<(B256, u64)> = tx_info.iter()
                     .enumerate()
@@ -157,6 +160,21 @@ where
             .collect();
         Ok(bodies)
     }
+}
+
+/// The withdrawals a stored body carries: only those its header commits to.
+///
+/// `EthStorage` reads withdrawals for every block at or after the Shanghai timestamp. BSC
+/// activates Shanghai only after London (go-bsc `IsShanghai` = `IsLondon(num)` && time), so
+/// on a chain whose Shanghai time is already past at a London block > 0 (private networks),
+/// the blocks before London have no `withdrawalsRoot` yet were served with `withdrawals: []`.
+/// go-bsc's downloader rejects such a body ("retrieved block body is invalid") and drops the
+/// peer, so a go-bsc node could not sync from reth-bsc.
+fn committed_withdrawals(
+    withdrawals: Option<Withdrawals>,
+    has_withdrawals_root: bool,
+) -> Option<Withdrawals> {
+    withdrawals.filter(|_| has_withdrawals_root)
 }
 
 /// Look up blob sidecars from the blob store.
@@ -252,5 +270,44 @@ impl ChainStorage<BscPrimitives> for BscStorage {
         Types: NodeTypesForProvider<Primitives = BscPrimitives>,
     {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_eips::eip4895::Withdrawal;
+
+    #[test]
+    fn a_body_keeps_only_the_withdrawals_its_header_commits_to() {
+        let one = Withdrawals::new(vec![Withdrawal { index: 1, ..Default::default() }]);
+        // Shanghai timestamp passed, London (and so BSC's Shanghai) not yet: no withdrawalsRoot.
+        assert_eq!(committed_withdrawals(Some(Withdrawals::default()), false), None);
+        assert_eq!(committed_withdrawals(Some(one.clone()), false), None);
+        // Shanghai active: the stored withdrawals, empty or not.
+        assert_eq!(
+            committed_withdrawals(Some(Withdrawals::default()), true),
+            Some(Withdrawals::default())
+        );
+        assert_eq!(committed_withdrawals(Some(one.clone()), true), Some(one));
+        assert_eq!(committed_withdrawals(None, false), None);
+    }
+
+    #[test]
+    fn a_pre_shanghai_body_encodes_without_withdrawals() {
+        use alloy_rlp::Encodable;
+        // What go-bsc's downloader checks: a header without withdrawalsRoot needs a body
+        // without the withdrawals list.
+        let body = BscBlockBody {
+            inner: reth_ethereum_primitives::BlockBody {
+                withdrawals: committed_withdrawals(Some(Withdrawals::default()), false),
+                ..Default::default()
+            },
+            sidecars: None,
+        };
+        let mut out = Vec::new();
+        body.encode(&mut out);
+        // [transactions, ommers]: two empty lists.
+        assert_eq!(out, vec![0xc2, 0xc0, 0xc0]);
     }
 }
