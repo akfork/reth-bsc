@@ -570,7 +570,6 @@ fn main() -> eyre::Result<()> {
                         // external builders running rbuilder in IPC/HTTP state mode).
                         tracing::info!("Start to register rbuilder State RPC API...");
                         use reth_bsc::rpc::rbuilder_state::{RbuilderStateApiImpl, RbuilderStateApiServer};
-                        let chain_spec = std::sync::Arc::new(ctx.config().chain.clone().as_ref().clone());
                         let rbuilder_api = RbuilderStateApiImpl::new(ctx.provider().clone());
                         // Unconditional like `parlia`: every method is read-only and the
                         // namespace is unknown to reth's module list.
