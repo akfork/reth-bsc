@@ -1,4 +1,3 @@
-use crate::node::miner::payload::DELAY_LEFT_OVER;
 use crate::chainspec::BscChainSpec;
 use crate::consensus::parlia::{Snapshot, SnapshotProvider};
 use crate::hardforks::BscHardforks;
@@ -6,6 +5,7 @@ use crate::node::miner::bid_block::BidBlockArgs;
 use crate::node::miner::bid_simulator::Bid;
 use crate::node::miner::config::keystore;
 use crate::node::miner::config::MiningConfig;
+use crate::node::miner::payload::DELAY_LEFT_OVER;
 use alloy_consensus::BlobTransactionSidecar;
 use alloy_consensus::Transaction;
 use alloy_consensus::{transaction::RlpEcdsaDecodableTx, TxEip4844WithSidecar};
@@ -1322,14 +1322,53 @@ mod bid_block_param_tests {
         assert_eq!(json.get("GRPCEnabled"), Some(&serde_json::Value::Bool(true)));
     }
 
-    #[test]
-    fn the_reported_simulation_time_covers_the_simulators_cutoff() {
-        // go-bsc defaults: DelayLeftOver 15 ms, BidSimulationLeftOver 20 ms. The simulator stops
-        // 120 ms before the block, so a bid must arrive 120 + 20 ms before it.
-        assert_eq!(effective_bid_simulation_left_over_ms(20, 15), 125);
-        assert_eq!(15 + effective_bid_simulation_left_over_ms(20, 15), DELAY_LEFT_OVER + 20);
+    /// Snapshot provider for an API whose `params` never reads a snapshot.
+    struct NoSnapshots;
+    impl SnapshotProvider for NoSnapshots {
+        fn snapshot_by_hash(&self, _block_hash: &B256) -> Option<Snapshot> {
+            None
+        }
+        fn insert(&self, _snapshot: Snapshot) {}
+    }
+
+    fn api_with_left_overs(bid_simulation_left_over: u64, delay_left_over: u64) -> MevApiImpl {
+        MevApiImpl {
+            snapshot_provider: Arc::new(NoSnapshots),
+            chain_spec: Arc::new(BscChainSpec::from(crate::chainspec::bsc_testnet())),
+            validator_address: Address::ZERO,
+            validator_commission: 100,
+            bid_simulation_left_over,
+            no_interrupt_left_over: 400,
+            delay_left_over,
+            max_bids_per_builder: 3,
+            gas_ceil: 0,
+            min_gas_price: U256::ZERO,
+            builder_fee_ceil: U256::ZERO,
+            bid_block_enabled: false,
+            grpc_enabled: false,
+            version: "test".to_string(),
+            allowed_builders: Arc::new(RwLock::new(HashSet::new())),
+            pending_bids: Arc::new(RwLock::new(PendingBids::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn mev_params_times_bids_by_the_simulators_cutoff() {
+        // A builder sends its last bid at BidBetterBefore = block time - DelayLeftOver -
+        // BidSimulationLeftOver. The simulator starts nothing with less than DELAY_LEFT_OVER
+        // left, so with go-bsc's defaults (15 ms, 20 ms) that deadline must be 120 + 20 ms.
+        let ms = 1_000_000;
+        let params = api_with_left_overs(20, 15).params().await.unwrap();
+        assert_eq!(params.delay_left_over, 15 * ms, "DelayLeftOver is still the BidBlock deadline");
+        assert_eq!(params.bid_simulation_left_over, 125 * ms);
+        assert_eq!(
+            params.delay_left_over + params.bid_simulation_left_over,
+            (DELAY_LEFT_OVER + 20) * ms
+        );
+
         // A DelayLeftOver configured past the cutoff needs nothing added.
-        assert_eq!(effective_bid_simulation_left_over_ms(20, 150), 20);
+        let params = api_with_left_overs(20, 150).params().await.unwrap();
+        assert_eq!(params.bid_simulation_left_over, 20 * ms);
     }
 
     #[test]
