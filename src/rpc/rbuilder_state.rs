@@ -127,11 +127,25 @@ fn is_truncated_read(error: &ProviderError) -> bool {
     false
 }
 
-/// Runs `read`, again while it fails on a truncated read and the budget lasts.
-async fn retry_truncated_reads<T>(mut read: impl FnMut() -> RpcResult<T>) -> RpcResult<T> {
+/// Runs `read` on a blocking thread, again while it fails on a truncated read and the
+/// budget lasts.
+///
+/// The unwind also makes reth's static-file reader panic: it slices changeset data through
+/// offsets the truncation left at 0 (`NippyJar::data`: "slice index starts at … but ends
+/// at 0"). On the RPC's async worker that panic dropped the connection without an answer;
+/// on a blocking thread it is caught, and retried like an `UnexpectedEof`.
+async fn retry_truncated_reads<T, F>(read: F) -> RpcResult<T>
+where
+    T: Send + 'static,
+    F: Fn() -> RpcResult<T> + Clone + Send + 'static,
+{
     let start = Instant::now();
     loop {
-        match read() {
+        let result = match tokio::task::spawn_blocking(read.clone()).await {
+            Ok(result) => result,
+            Err(error) => Err(join_error(error)),
+        };
+        match result {
             Err(error)
                 if error.code() == TRUNCATED_READ_CODE &&
                     start.elapsed() + TRUNCATED_READ_BACKOFF <= TRUNCATED_READ_BUDGET =>
@@ -146,6 +160,31 @@ async fn retry_truncated_reads<T>(mut read: impl FnMut() -> RpcResult<T>) -> Rpc
             result => return result,
         }
     }
+}
+
+/// A blocking read that did not return. A slice-index panic is reth's static-file reader
+/// running into an unwind (see [`retry_truncated_reads`]); any other panic, or a cancelled
+/// task, is a plain failure.
+fn join_error(error: tokio::task::JoinError) -> jsonrpsee::types::ErrorObjectOwned {
+    if !error.is_panic() {
+        return jsonrpsee::types::ErrorObject::owned(-32050, error.to_string(), None::<()>);
+    }
+    let payload = error.into_panic();
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload");
+    let code = if message.contains("slice index") || message.contains("out of range for slice") {
+        TRUNCATED_READ_CODE
+    } else {
+        -32050
+    };
+    jsonrpsee::types::ErrorObject::owned(
+        code,
+        format!("state read panicked: {message}"),
+        None::<()>,
+    )
 }
 
 /// Resolve a [`BlockId`] into a historical state provider. rbuilder always
@@ -261,21 +300,23 @@ where
 #[async_trait::async_trait]
 impl<Provider> RbuilderStateApiServer for RbuilderStateApiImpl<Provider>
 where
-    Provider: StateProviderFactory + BlockNumReader + BlockIdReader + Send + Sync + 'static,
+    Provider: StateProviderFactory + BlockNumReader + BlockIdReader + Clone + Send + Sync + 'static,
 {
     async fn get_account(
         &self,
         address: Address,
         block_id: alloy_rpc_types::BlockId,
     ) -> RpcResult<Option<RbuilderAccountState>> {
-        retry_truncated_reads(|| self.account(address, block_id)).await
+        let api = self.clone();
+        retry_truncated_reads(move || api.account(address, block_id)).await
     }
 
     async fn get_code_by_hash(&self, code_hash: B256) -> RpcResult<Option<Bytes>> {
         if code_hash == KECCAK_EMPTY || code_hash == B256::ZERO {
             return Ok(None);
         }
-        retry_truncated_reads(|| self.code_by_hash(code_hash)).await
+        let api = self.clone();
+        retry_truncated_reads(move || api.code_by_hash(code_hash)).await
     }
 
     async fn get_block_hash(
@@ -298,13 +339,19 @@ where
         block_id: alloy_rpc_types::BlockId,
         account_diffs: HashMap<Address, RbuilderAccountDiff>,
     ) -> RpcResult<B256> {
-        retry_truncated_reads(|| self.state_root(block_id, &account_diffs)).await
+        let api = self.clone();
+        let account_diffs = std::sync::Arc::new(account_diffs);
+        retry_truncated_reads(move || api.state_root(block_id, &account_diffs)).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn eof() -> ProviderError {
         ProviderError::other(std::io::Error::new(
@@ -324,12 +371,17 @@ mod tests {
         assert_eq!(err(ProviderError::BestBlockNotFound).code(), -32050);
     }
 
+    fn counter() -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+
     #[tokio::test]
     async fn a_truncated_read_is_retried_until_the_unwind_is_done() {
-        let mut calls = 0;
-        let result = retry_truncated_reads(|| {
-            calls += 1;
-            if calls < 3 { Err(err(eof())) } else { Ok(calls) }
+        let calls = counter();
+        let seen = calls.clone();
+        let result = retry_truncated_reads(move || {
+            let call = seen.fetch_add(1, Ordering::SeqCst) + 1;
+            if call < 3 { Err(err(eof())) } else { Ok(call) }
         })
         .await;
         assert_eq!(result.unwrap(), 3);
@@ -338,23 +390,59 @@ mod tests {
     #[tokio::test]
     async fn retries_stop_within_the_budget() {
         let start = Instant::now();
-        let mut calls = 0;
-        let result: RpcResult<()> = retry_truncated_reads(|| {
-            calls += 1;
+        let calls = counter();
+        let seen = calls.clone();
+        let result: RpcResult<()> = retry_truncated_reads(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
             Err(err(eof()))
         })
         .await;
         assert_eq!(result.unwrap_err().code(), TRUNCATED_READ_CODE);
         assert!(start.elapsed() <= TRUNCATED_READ_BUDGET + TRUNCATED_READ_BACKOFF);
-        assert!(calls > 1);
+        assert!(calls.load(Ordering::SeqCst) > 1);
 
         // Any other failure is final at once.
-        let mut calls = 0;
-        let _: RpcResult<()> = retry_truncated_reads(|| {
-            calls += 1;
+        let calls = counter();
+        let seen = calls.clone();
+        let _: RpcResult<()> = retry_truncated_reads(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
             Err(err(ProviderError::BestBlockNotFound))
         })
         .await;
-        assert_eq!(calls, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// reth's static-file reader panics on offsets an unwind zeroed: retried, not a
+    /// dropped connection.
+    #[tokio::test]
+    async fn a_slice_panic_during_an_unwind_is_retried() {
+        let calls = counter();
+        let seen = calls.clone();
+        let result = retry_truncated_reads(move || {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                let data = [0u8; 4];
+                let (start, end) = (std::hint::black_box(3), std::hint::black_box(0));
+                let _ = &data[start..end];
+            }
+            Ok(7)
+        })
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn any_other_panic_is_a_plain_failure() {
+        let calls = counter();
+        let seen = calls.clone();
+        let result: RpcResult<()> = retry_truncated_reads(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            panic!("unrelated bug");
+        })
+        .await;
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), -32050);
+        assert!(error.message().contains("unrelated bug"), "{}", error.message());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
