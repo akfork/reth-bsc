@@ -18,10 +18,11 @@
 use alloy_primitives::{map::HashMap, Address, Bytes, B256, U256};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
-use reth_provider::{BlockNumReader, StateProviderFactory};
+use reth_provider::{BlockNumReader, ProviderError, StateProviderFactory};
 use reth_storage_api::BlockIdReader;
 use reth_trie::HashedPostState;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 /// One account's pending changes as sent by the builder
 /// (rbuilder `AccountDiff`).
@@ -92,8 +93,59 @@ impl<Provider> RbuilderStateApiImpl<Provider> {
     }
 }
 
-fn err(e: impl std::fmt::Display) -> jsonrpsee::types::ErrorObjectOwned {
-    jsonrpsee::types::ErrorObject::owned(-32050, e.to_string(), None::<()>)
+/// Error code of a read that kept running into an on-disk unwind (see
+/// [`is_truncated_read`]); rbuilder takes it as transient.
+pub const TRUNCATED_READ_CODE: i32 = -32052;
+
+/// How long a request keeps retrying reads that ran into an on-disk unwind. rbuilder gives
+/// a state-root call 300 ms; the unwinds seen on a privnet truncate for about 80 ms.
+const TRUNCATED_READ_BUDGET: Duration = Duration::from_millis(150);
+const TRUNCATED_READ_BACKOFF: Duration = Duration::from_millis(25);
+
+fn err(e: ProviderError) -> jsonrpsee::types::ErrorObjectOwned {
+    let code = if is_truncated_read(&e) { TRUNCATED_READ_CODE } else { -32050 };
+    jsonrpsee::types::ErrorObject::owned(code, e.to_string(), None::<()>)
+}
+
+/// Whether a read ran past the end of a static file.
+///
+/// Reth unwinds a persisted block (a reorg of the head it just persisted) by truncating the
+/// changeset files in place, while readers opened before keep their old length: a
+/// historical read at the parent then fails with `UnexpectedEof` ("failed to fill whole
+/// buffer"). The same read succeeds once the unwind is done.
+fn is_truncated_read(error: &ProviderError) -> bool {
+    let mut source = error.as_other().map(|e| e as &(dyn std::error::Error + 'static));
+    while let Some(error) = source {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+/// Runs `read`, again while it fails on a truncated read and the budget lasts.
+async fn retry_truncated_reads<T>(mut read: impl FnMut() -> RpcResult<T>) -> RpcResult<T> {
+    let start = Instant::now();
+    loop {
+        match read() {
+            Err(error)
+                if error.code() == TRUNCATED_READ_CODE &&
+                    start.elapsed() + TRUNCATED_READ_BACKOFF <= TRUNCATED_READ_BUDGET =>
+            {
+                tracing::debug!(
+                    target: "rpc::rbuilder",
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "state read ran into an on-disk unwind, retrying"
+                );
+                tokio::time::sleep(TRUNCATED_READ_BACKOFF).await;
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Resolve a [`BlockId`] into a historical state provider. rbuilder always
@@ -115,26 +167,25 @@ where
                     None::<()>,
                 )
             })?;
-            provider.block_hash(n).map_err(|e| err(e))?
+            provider.block_hash(n).map_err(err)?
         }
     };
     let hash = block_hash
         .ok_or_else(|| jsonrpsee::types::ErrorObject::owned(-32050, "block not found", None::<()>))?;
-    provider.history_by_block_hash(hash).map_err(|e| err(e))
+    provider.history_by_block_hash(hash).map_err(err)
 }
 
-#[async_trait::async_trait]
-impl<Provider> RbuilderStateApiServer for RbuilderStateApiImpl<Provider>
+impl<Provider> RbuilderStateApiImpl<Provider>
 where
-    Provider: StateProviderFactory + BlockNumReader + BlockIdReader + Send + Sync + 'static,
+    Provider: StateProviderFactory + BlockNumReader + BlockIdReader,
 {
-    async fn get_account(
+    fn account(
         &self,
         address: Address,
         block_id: alloy_rpc_types::BlockId,
     ) -> RpcResult<Option<RbuilderAccountState>> {
         let provider = resolve_history_provider(&self.provider, block_id)?;
-        let account = provider.basic_account(&address).map_err(|e| err(e))?;
+        let account = provider.basic_account(&address).map_err(err)?;
         Ok(account.map(|a| RbuilderAccountState {
             nonce: U256::from(a.nonce),
             balance: a.balance,
@@ -142,40 +193,22 @@ where
         }))
     }
 
-    async fn get_code_by_hash(&self, code_hash: B256) -> RpcResult<Option<Bytes>> {
-        if code_hash == KECCAK_EMPTY || code_hash == B256::ZERO {
-            return Ok(None);
-        }
-        let latest = self.provider.best_block_number().map_err(|e| err(e))?;
+    fn code_by_hash(&self, code_hash: B256) -> RpcResult<Option<Bytes>> {
+        let latest = self.provider.best_block_number().map_err(err)?;
         let hash = self
             .provider
             .block_hash(latest)
-            .map_err(|e| err(e))?
+            .map_err(err)?
             .ok_or_else(|| jsonrpsee::types::ErrorObject::owned(-32050, "head block not found", None::<()>))?;
-        let provider = self.provider.history_by_block_hash(hash).map_err(|e| err(e))?;
-        let code = provider.bytecode_by_hash(&code_hash).map_err(|e| err(e))?;
+        let provider = self.provider.history_by_block_hash(hash).map_err(err)?;
+        let code = provider.bytecode_by_hash(&code_hash).map_err(err)?;
         Ok(code.map(|b| b.original_bytes()))
     }
 
-    async fn get_block_hash(
-        &self,
-        number: alloy_rpc_types::BlockNumberOrTag,
-    ) -> RpcResult<Option<B256>> {
-        let block_number = number.as_number().ok_or_else(|| {
-            jsonrpsee::types::ErrorObject::owned(
-                -32051,
-                "only numeric block numbers are supported",
-                None::<()>,
-            )
-        })?;
-        let hash = self.provider.block_hash(block_number).map_err(|e| err(e))?;
-        Ok(hash)
-    }
-
-    async fn calculate_state_root(
+    fn state_root(
         &self,
         block_id: alloy_rpc_types::BlockId,
-        account_diffs: HashMap<Address, RbuilderAccountDiff>,
+        account_diffs: &HashMap<Address, RbuilderAccountDiff>,
     ) -> RpcResult<B256> {
         let state_provider = resolve_history_provider(&self.provider, block_id)?;
 
@@ -196,8 +229,8 @@ where
             // Base account from the historical state; apply the builder's diff
             // on top (rbuilder sends only the changed fields).
             let mut info = state_provider
-                .basic_account(&address)
-                .map_err(|e| err(e))?
+                .basic_account(address)
+                .map_err(err)?
                 .unwrap_or_default();
 
             if let Some(balance) = diff.balance {
@@ -213,15 +246,115 @@ where
 
             if !diff.changed_slots.is_empty() {
                 let storage = hashed.storages.entry(hashed_address).or_default();
-                for (slot, value) in diff.changed_slots {
+                for (slot, value) in &diff.changed_slots {
                     storage
                         .storage
-                        .insert(alloy_primitives::keccak256(B256::new(slot.to_be_bytes())), value);
+                        .insert(alloy_primitives::keccak256(B256::new(slot.to_be_bytes())), *value);
                 }
             }
         }
 
-        let root = state_provider.state_root(hashed).map_err(|e| err(e))?;
-        Ok(root)
+        state_provider.state_root(hashed).map_err(err)
+    }
+}
+
+#[async_trait::async_trait]
+impl<Provider> RbuilderStateApiServer for RbuilderStateApiImpl<Provider>
+where
+    Provider: StateProviderFactory + BlockNumReader + BlockIdReader + Send + Sync + 'static,
+{
+    async fn get_account(
+        &self,
+        address: Address,
+        block_id: alloy_rpc_types::BlockId,
+    ) -> RpcResult<Option<RbuilderAccountState>> {
+        retry_truncated_reads(|| self.account(address, block_id)).await
+    }
+
+    async fn get_code_by_hash(&self, code_hash: B256) -> RpcResult<Option<Bytes>> {
+        if code_hash == KECCAK_EMPTY || code_hash == B256::ZERO {
+            return Ok(None);
+        }
+        retry_truncated_reads(|| self.code_by_hash(code_hash)).await
+    }
+
+    async fn get_block_hash(
+        &self,
+        number: alloy_rpc_types::BlockNumberOrTag,
+    ) -> RpcResult<Option<B256>> {
+        let block_number = number.as_number().ok_or_else(|| {
+            jsonrpsee::types::ErrorObject::owned(
+                -32051,
+                "only numeric block numbers are supported",
+                None::<()>,
+            )
+        })?;
+        let hash = self.provider.block_hash(block_number).map_err(err)?;
+        Ok(hash)
+    }
+
+    async fn calculate_state_root(
+        &self,
+        block_id: alloy_rpc_types::BlockId,
+        account_diffs: HashMap<Address, RbuilderAccountDiff>,
+    ) -> RpcResult<B256> {
+        retry_truncated_reads(|| self.state_root(block_id, &account_diffs)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eof() -> ProviderError {
+        ProviderError::other(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        ))
+    }
+
+    #[test]
+    fn a_read_past_a_truncated_file_has_its_own_code() {
+        assert!(is_truncated_read(&eof()));
+        assert_eq!(err(eof()).code(), TRUNCATED_READ_CODE);
+
+        let other = ProviderError::other(std::io::Error::other("disk on fire"));
+        assert!(!is_truncated_read(&other));
+        assert_eq!(err(other).code(), -32050);
+        assert_eq!(err(ProviderError::BestBlockNotFound).code(), -32050);
+    }
+
+    #[tokio::test]
+    async fn a_truncated_read_is_retried_until_the_unwind_is_done() {
+        let mut calls = 0;
+        let result = retry_truncated_reads(|| {
+            calls += 1;
+            if calls < 3 { Err(err(eof())) } else { Ok(calls) }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn retries_stop_within_the_budget() {
+        let start = Instant::now();
+        let mut calls = 0;
+        let result: RpcResult<()> = retry_truncated_reads(|| {
+            calls += 1;
+            Err(err(eof()))
+        })
+        .await;
+        assert_eq!(result.unwrap_err().code(), TRUNCATED_READ_CODE);
+        assert!(start.elapsed() <= TRUNCATED_READ_BUDGET + TRUNCATED_READ_BACKOFF);
+        assert!(calls > 1);
+
+        // Any other failure is final at once.
+        let mut calls = 0;
+        let _: RpcResult<()> = retry_truncated_reads(|| {
+            calls += 1;
+            Err(err(ProviderError::BestBlockNotFound))
+        })
+        .await;
+        assert_eq!(calls, 1);
     }
 }
